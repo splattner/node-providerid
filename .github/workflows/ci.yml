@@ -11,15 +11,37 @@ permissions:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.21
+        ports:
+          - 2379:2379
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+        options: >-
+          --health-cmd "etcdctl endpoint health"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
           cache: true
 
       - run: go mod download
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
 
       - name: Verify go.mod is tidy
         run: |
@@ -28,7 +50,18 @@ jobs:
 
       - run: go vet ./...
 
-      - run: go test ./... -race
+      - name: Test (with etcd integration tests)
+        env:
+          ETCD_TEST_ENDPOINT: http://localhost:2379
+        run: go test ./... -race
 
       - name: Build
         run: go build -o node-providerid .
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
