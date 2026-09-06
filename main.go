@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"regexp"
@@ -16,6 +17,9 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
+
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -26,26 +30,32 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: node-providerid get|set [flags]; use get -h or set -h")
+		return errors.New("usage: node-providerid get|set|list [flags]; use <command> -h for flags")
 	}
 	command := args[0]
-	if command == "-h" || command == "--help" {
-		fmt.Println("Usage: node-providerid get|set [flags]\nUse get -h or set -h for flags.")
+	switch command {
+	case "-h", "--help":
+		fmt.Println("Usage: node-providerid get|set|list [flags]\nUse get -h, set -h or list -h for flags.")
 		return nil
-	}
-	if command != "get" && command != "set" {
+	case "-v", "--version", "version":
+		fmt.Println(version)
+		return nil
+	case "get", "set", "list":
+	default:
 		return fmt.Errorf("unknown command %q", command)
 	}
 	f := flag.NewFlagSet(command, flag.ContinueOnError)
-	node := f.String("node", "", "Kubernetes Node name (required)")
 	endpoints := f.String("endpoints", "https://127.0.0.1:2379", "comma-separated etcd client endpoints")
 	prefix := f.String("prefix", "/registry", "Kubernetes etcd storage prefix")
 	ca := f.String("cacert", "/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt", "trusted etcd CA certificate")
 	cert := f.String("cert", "/var/lib/rancher/k3s/server/tls/etcd/server-client.crt", "etcd client certificate")
 	key := f.String("key", "/var/lib/rancher/k3s/server/tls/etcd/server-client.key", "etcd client private key")
 	timeout := f.Duration("timeout", 10*time.Second, "timeout for each etcd operation")
-	var providerID, expected, backup string
+	var node, providerID, expected, backup string
 	var dryRun bool
+	if command != "list" {
+		f.StringVar(&node, "node", "", "Kubernetes Node name (required)")
+	}
 	if command == "set" {
 		f.StringVar(&providerID, "provider-id", "", "new providerID; explicitly pass an empty string to clear")
 		f.StringVar(&expected, "expect", "", "optional expected current providerID")
@@ -63,9 +73,11 @@ func run(args []string) error {
 	}
 	seen := map[string]bool{}
 	f.Visit(func(v *flag.Flag) { seen[v.Name] = true })
-	validName := regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
-	if len(*node) > 253 || !validName.MatchString(*node) {
-		return errors.New("--node must be a nonempty DNS subdomain Node name")
+	if command != "list" {
+		validName := regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+		if len(node) > 253 || !validName.MatchString(node) {
+			return errors.New("--node must be a nonempty DNS subdomain Node name")
+		}
 	}
 	if *timeout <= 0 {
 		return errors.New("--timeout must be positive")
@@ -82,24 +94,18 @@ func run(args []string) error {
 		return errors.New("--prefix must be an absolute etcd prefix without //")
 	}
 	// Kubernetes retains the historical 'minions' storage resource name.
-	etcdKey := strings.TrimRight(*prefix, "/") + "/minions/" + *node
-	tlsConfig, err := loadTLS(*ca, *cert, *key)
-	if err != nil {
-		return err
-	}
-	eps := strings.Split(*endpoints, ",")
-	for i, endpoint := range eps {
-		eps[i] = strings.TrimSpace(endpoint)
-		u, err := url.Parse(eps[i])
-		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("invalid HTTPS etcd endpoint %q", eps[i])
-		}
-	}
-	cli, err := clientv3.New(clientv3.Config{Endpoints: eps, TLS: tlsConfig, DialTimeout: *timeout})
+	keyPrefix := strings.TrimRight(*prefix, "/") + "/minions/"
+	cli, eps, err := dialEtcd(*ca, *cert, *key, *endpoints, *timeout)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
+
+	if command == "list" {
+		return listNodes(cli, keyPrefix, *timeout, os.Stdout)
+	}
+
+	etcdKey := keyPrefix + node
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	resp, err := cli.Get(ctx, etcdKey)
 	cancel()
@@ -114,7 +120,7 @@ func run(args []string) error {
 	if command == "set" {
 		next = &providerID
 	}
-	current, updated, err := nodeValue(kv.Value, *node, next)
+	current, updated, err := nodeValue(kv.Value, node, next)
 	if err != nil {
 		return err
 	}
@@ -126,7 +132,7 @@ func run(args []string) error {
 		return fmt.Errorf("providerID mismatch: current %q, expected %q", current, expected)
 	}
 	if current == providerID {
-		fmt.Printf("unchanged: %s providerID=%q\n", *node, current)
+		fmt.Printf("unchanged: %s providerID=%q\n", node, current)
 		return nil
 	}
 	if dryRun {
@@ -135,11 +141,13 @@ func run(args []string) error {
 	}
 	// Durable per-key backup is created before the conditional write.
 	if err := saveBackup(backup, map[string]any{
-		"key": etcdKey, "node": *node, "providerID": current,
+		"key": etcdKey, "node": node, "providerID": current,
 		"value_base64": kv.Value, "mod_revision": kv.ModRevision,
 		"create_revision": kv.CreateRevision, "lease": kv.Lease,
-		"cluster_id": fmt.Sprint(resp.Header.ClusterId),
-		"endpoints":  eps, "saved_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"cluster_id":   fmt.Sprint(resp.Header.ClusterId),
+		"endpoints":    eps,
+		"tool_version": version,
+		"saved_at":     time.Now().UTC().Format(time.RFC3339Nano),
 	}); err != nil {
 		return fmt.Errorf("backup: %w", err)
 	}
@@ -152,8 +160,58 @@ func run(args []string) error {
 	if !txn.Succeeded {
 		return errors.New("Node changed concurrently; nothing was written by this attempt; read again and retry with a new backup path")
 	}
-	fmt.Printf("updated: %s providerID %q -> %q (revision=%d, backup=%s)\n", *node, current, providerID, txn.Header.Revision, backup)
+	fmt.Printf("updated: %s providerID %q -> %q (revision=%d, backup=%s)\n", node, current, providerID, txn.Header.Revision, backup)
 	return nil
+}
+
+// listNodes prints "<name>\t<providerID>" for every stored Node, sorted by name.
+// It is read-only. Entries that cannot be decoded are reported on stderr and
+// cause a non-zero exit without stopping the listing.
+func listNodes(cli *clientv3.Client, keyPrefix string, timeout time.Duration, out io.Writer) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	resp, err := cli.Get(ctx, keyPrefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	cancel()
+	if err != nil {
+		return fmt.Errorf("read etcd: %w", err)
+	}
+	failed := false
+	for _, kv := range resp.Kvs {
+		name := strings.TrimPrefix(string(kv.Key), keyPrefix)
+		if name == "" || strings.Contains(name, "/") {
+			continue
+		}
+		current, _, err := nodeValue(kv.Value, name, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", name, err)
+			failed = true
+			continue
+		}
+		fmt.Fprintf(out, "%s\t%s\n", name, current)
+	}
+	if failed {
+		return errors.New("one or more Node entries could not be decoded")
+	}
+	return nil
+}
+
+func dialEtcd(caFile, certFile, keyFile, endpoints string, timeout time.Duration) (*clientv3.Client, []string, error) {
+	tlsConfig, err := loadTLS(caFile, certFile, keyFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	eps := strings.Split(endpoints, ",")
+	for i, endpoint := range eps {
+		eps[i] = strings.TrimSpace(endpoint)
+		u, err := url.Parse(eps[i])
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			return nil, nil, fmt.Errorf("invalid HTTPS etcd endpoint %q", eps[i])
+		}
+	}
+	cli, err := clientv3.New(clientv3.Config{Endpoints: eps, TLS: tlsConfig, DialTimeout: timeout})
+	if err != nil {
+		return nil, nil, err
+	}
+	return cli, eps, nil
 }
 
 func compareAndPut(ctx context.Context, cli *clientv3.Client, key string, revision, lease int64, value []byte) (*clientv3.TxnResponse, error) {

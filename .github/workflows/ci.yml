@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  ETCD_VERSION: v3.5.21
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
@@ -16,10 +19,19 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
           cache: true
 
       - run: go mod download
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
 
       - name: Verify go.mod is tidy
         run: |
@@ -28,7 +40,36 @@ jobs:
 
       - run: go vet ./...
 
-      - run: go test ./... -race
+      - name: Start a disposable etcd
+        run: |
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 "etcd-${ETCD_VERSION}-linux-amd64/etcd"
+          ./etcd --data-dir "$(mktemp -d)" \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            --log-level error &
+          echo "ETCD_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:2379/health && break
+            sleep 1
+          done
+
+      - name: Test (with etcd integration tests)
+        env:
+          ETCD_TEST_ENDPOINT: http://127.0.0.1:2379
+        run: go test ./... -race
+
+      - name: Stop etcd
+        if: always()
+        run: kill "$ETCD_PID" 2>/dev/null || true
 
       - name: Build
         run: go build -o node-providerid .
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
