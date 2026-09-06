@@ -5,6 +5,66 @@ through the etcd v3 API. Defaults target embedded etcd on a k3s server.
 It does not open or edit etcd database files and does not call the Kubernetes API.
 It requires an actual etcd-backed cluster; SQLite/Kine databases are not supported.
 
+## Why this tool exists
+
+A Node's `spec.providerID` links the Kubernetes Node object to its machine in
+the cloud provider. The cloud-controller-manager and CSI drivers use it to
+attach volumes, manage load-balancer members, and delete Node objects for
+machines that no longer exist.
+
+Kubernetes treats `spec.providerID` as **immutable once set**. The API server
+rejects any attempt to change a non-empty value, and the field cannot be
+cleared through `kubectl edit`, `kubectl patch`, or a normal client. Yet it
+does get set wrong in practice:
+
+- a Node registered before the cloud provider was configured, so kubelet set a
+  placeholder such as `k3s://<node>`;
+- a migration between providers, or a change to the instance-ID scheme, that
+  left the stored value pointing at nothing;
+- a bad `--provider-id` / cloud-config value baked into a Node at first boot.
+
+The usual remedy is to drain, delete, and re-register the Node so it gets a
+fresh `providerID`. When that is not practical, the only remaining place to
+correct the value is the datastore itself. This tool does exactly that edit,
+against etcd, as narrowly and reversibly as possible: it patches only the
+`providerID` field, guards the write with an etcd compare-and-swap on the
+Node's revision, and records a per-key backup first.
+
+## ⚠️ Warning and disclaimer
+
+**`set` writes directly to your cluster's backing store. This is a dangerous,
+last-resort operation.** Read this section before running it.
+
+- **etcd is the single source of truth for the entire cluster.** A malformed
+  write to a Node key can make that Node object unreadable to the API server,
+  and a mistake in the key path or value can affect more than one object.
+- **Direct writes bypass every Kubernetes safety layer:** schema validation,
+  admission control, authorization, defaulting, and API audit logging. Nothing
+  checks that the value you write is sane.
+- **`get` is read-only and safe.** All of the risk is in `set`.
+- **Encoding is reverse-engineered.** The tool re-encodes the stored protobuf
+  (or JSON) Node object. It aims to copy every unrelated byte unchanged and
+  refuses ambiguous input, but it is not the Kubernetes apiserver's own
+  storage codec and is not covered by any compatibility guarantee.
+- **The change may not stick.** kubelet or a cloud-controller can overwrite
+  `providerID` again after you set it. Fix the source of the wrong value too.
+- **A controller may act on the new value immediately** — for example, the
+  cloud-controller-manager can delete a Node whose `providerID` no longer
+  resolves to a live instance.
+
+Before using `set`:
+
+1. Take a full etcd snapshot (`sudo k3s etcd-snapshot save ...`), not just the
+   per-key backup this tool writes.
+2. Try the supported path first: drain, delete, and re-register the Node.
+3. Run with `--dry-run`, then with `--expect` pinned to the current value.
+4. Test on a non-production cluster if you can.
+
+This software is provided "as is", without warranty of any kind, under the
+terms of the [MIT License](LICENSE). You are solely responsible for any use of
+it against your clusters and for any data loss or outage that results. It is
+not affiliated with or endorsed by the Kubernetes, etcd, or k3s projects.
+
 ## Build
 
 Use Go 1.23 or newer:
@@ -172,3 +232,7 @@ and publishes a GitHub Release; a workflow then builds and attaches the binaries
 - [Kubernetes protobuf envelope schema](https://github.com/kubernetes/apimachinery/blob/master/pkg/runtime/generated.proto)
 - [etcd transactions and revisions](https://etcd.io/docs/v3.5/learning/api/)
 - [k3s etcd snapshots](https://docs.k3s.io/cli/etcd-snapshot)
+
+## License
+
+[MIT](LICENSE)
