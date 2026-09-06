@@ -1,0 +1,5 @@
+/node-providerid
+/dist/
+*.test
+*.out
+*.log
