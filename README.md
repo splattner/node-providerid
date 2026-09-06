@@ -1,5 +1,9 @@
 # node-providerid
 
+[![CI](https://github.com/splattner/node-providerid/actions/workflows/ci.yml/badge.svg)](https://github.com/splattner/node-providerid/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/splattner/node-providerid?sort=semver)](https://github.com/splattner/node-providerid/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A Go CLI that reads or changes a Kubernetes Node's `spec.providerID` directly
 through the etcd v3 API. Defaults target embedded etcd on a k3s server.
 It does not open or edit etcd database files and does not call the Kubernetes API.
@@ -67,7 +71,7 @@ not affiliated with or endorsed by the Kubernetes, etcd, or k3s projects.
 
 ## Build
 
-Use Go 1.23 or newer:
+Use Go 1.25 or newer:
 
 ```sh
 go mod tidy
@@ -76,7 +80,8 @@ go build -o node-providerid .
 ```
 
 Run the binary on a k3s server with access to its etcd client certificates.
-Flags come **after** `get` or `set`.
+Flags come **after** the subcommand. `node-providerid --version` prints the
+build version.
 
 ## Install
 
@@ -89,6 +94,15 @@ curl -fsSLo node-providerid \
 chmod +x node-providerid
 ```
 
+Each release also has a `checksums.txt` and a SLSA build provenance attestation:
+
+```sh
+curl -fsSLO https://github.com/splattner/node-providerid/releases/latest/download/checksums.txt
+sha256sum -c checksums.txt --ignore-missing
+
+gh attestation verify node-providerid-linux-amd64 --repo splattner/node-providerid
+```
+
 ## Read
 
 ```sh
@@ -97,6 +111,17 @@ sudo ./node-providerid get --node worker-1
 
 Prints just the providerID followed by a newline. An unset/empty providerID
 prints a blank line. A missing Node is an error (exit status 1).
+
+## List
+
+```sh
+sudo ./node-providerid list
+```
+
+Prints one `<node-name><TAB><providerID>` line per stored Node, sorted by name,
+for a quick audit of every Node at once. It is read-only. A Node whose stored
+object cannot be decoded is reported on stderr and makes the command exit 1,
+but does not stop the listing.
 
 ## Change
 
@@ -139,6 +164,22 @@ the transaction. It is a per-key recovery record, not a full etcd snapshot.
 An existing file is never overwritten. A failed write can leave a backup;
 use a new filename for subsequent attempts. A no-op or dry-run creates no file.
 
+```json
+{
+  "key": "/registry/minions/worker-1",
+  "node": "worker-1",
+  "providerID": "k3s://worker-1",
+  "value_base64": "azhzAAo...=",
+  "mod_revision": 123456,
+  "create_revision": 42,
+  "lease": 0,
+  "cluster_id": "14841639068965178418",
+  "endpoints": ["https://127.0.0.1:2379"],
+  "tool_version": "v1.0.0",
+  "saved_at": "2026-01-02T15:04:05.999999999Z"
+}
+```
+
 The write uses an etcd transaction comparing the Node's **modification revision**
 against the revision just read. Any intervening update or deletion causes failure
 without a write. There is no automatic conflict retry. On a timeout or transport
@@ -152,6 +193,11 @@ Verify both etcd and the Kubernetes API:
 sudo ./node-providerid get --node worker-1
 sudo k3s kubectl get node worker-1 -o jsonpath='{.spec.providerID}{"\n"}'
 ```
+
+No apiserver restart is needed. The apiserver serves Nodes from a watch on
+etcd, so it observes the new value on the next watch event; its watch cache
+converges within a second or so. If the API still shows the old value after a
+few seconds, a controller has written it back.
 
 To reverse just this change, run `set` with the old providerID recorded in the
 backup, `--expect` set to the new value, and a fresh backup path. This preserves
@@ -174,6 +220,11 @@ Multiple HTTPS endpoints can be comma-separated. Server certificate verification
 is always enabled. The endpoint must match the server certificate's SANs.
 This CLI uses mutual TLS and does not implement etcd username/password login.
 
+On an HA k3s cluster (three embedded-etcd servers), point `--endpoints` at any
+one member — a write goes through Raft to a quorum before it commits, and the
+compare-and-swap semantics are cluster-wide. Run the tool from one server;
+there is no need to repeat it per member.
+
 Kubernetes Node keys use the historical resource name `minions`, so the default
 key is `/registry/minions/<node-name>`. `--prefix` changes the storage prefix.
 The stored object must identify itself as `v1/Node` and its metadata name must
@@ -194,36 +245,47 @@ match `--node` before either reading the providerID or writing.
 - The supplied ID is used verbatim, including an explicitly empty ID. Choose
   a provider-specific value appropriate for your cloud-controller and CSI setup.
 
-## Tests
+## Exit codes
 
-Validated in this workspace with Go 1.24.4: build, unit tests and the optional
-integration test against disposable etcd 3.5.21 passed. The live k3s deployment
-and its mutual-TLS connection were not available for testing. The fuzz seed
-cases ran as part of unit tests; an extended fuzz campaign was not run.
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. For `set`, this includes a no-op (`--provider-id` already matches) and a `--dry-run`. |
+| `1` | Any error: bad flags, Node not found, `--expect` mismatch, undecodable stored object, backup path exists, concurrent modification, or an etcd/TLS failure. `set` prints whether anything was written. |
+
+`get` writes only the providerID to stdout; `list` writes `name<TAB>providerID`
+lines to stdout. All diagnostics go to stderr.
+
+## Tests
 
 Unit tests cover protobuf unknown-field preservation, JSON numeric precision,
 missing/empty values, invalid storage, name mismatches, and backup exclusivity.
-The fuzz target checks successful codec transformations round-trip.
+The fuzz target checks that successful codec transformations round-trip.
 
-An optional integration test verifies successful writes, stale-revision rejection,
-lease preservation and deleted-key rejection against a **disposable** etcd instance:
+Integration tests run against a **disposable** etcd instance and are skipped
+unless `ETCD_TEST_ENDPOINT` is set. They cover conditional writes (success,
+stale-revision rejection, lease preservation, deleted-key rejection) and the
+`list` output. They use keys outside `/registry` and clean up after themselves,
+over a plaintext connection — the production CLI still requires HTTPS and mutual
+TLS.
 
 ```sh
-ETCD_TEST_ENDPOINT=http://127.0.0.1:2379 go test -run TestEtcdCompareAndPut -v
+# with a throwaway local etcd on 127.0.0.1:2379
+ETCD_TEST_ENDPOINT=http://127.0.0.1:2379 go test ./... -v
 ```
 
-The integration test uses a random key under `/node-providerid-test/`, removes
-it afterward, and skips when the environment variable is absent. Its client is
-for local test etcd without TLS; the production CLI requires HTTPS and mutual TLS.
+CI runs `gofmt`, `go vet`, `go test -race` (with an etcd service container so
+the integration tests execute), a build, and `govulncheck`.
 
 ## Contributing
 
-`main` is protected: all changes land through pull requests that pass CI
-(`go vet`, `go test -race`, build). Commit messages follow
-[Conventional Commits](https://www.conventionalcommits.org/) —
+`main` is protected: every change lands through a pull request that passes CI.
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) —
 [release-please](https://github.com/googleapis/release-please) uses them to
 maintain `CHANGELOG.md` and open a release PR. Merging that PR tags the version
-and publishes a GitHub Release; a workflow then builds and attaches the binaries.
+and publishes a GitHub Release; the release workflow then cross-compiles the
+binaries, writes `checksums.txt`, attaches a build provenance attestation, and
+uploads everything to the release. [Renovate](https://docs.renovatebot.com/)
+keeps dependencies and Actions current.
 
 ## References
 
