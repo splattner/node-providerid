@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -10,9 +11,8 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Run only against a disposable, local etcd instance. This test uses a random
-// key outside /registry and removes it after testing successful and stale writes.
-func TestEtcdCompareAndPut(t *testing.T) {
+func testEtcdClient(t *testing.T) *clientv3.Client {
+	t.Helper()
 	endpoint := os.Getenv("ETCD_TEST_ENDPOINT")
 	if endpoint == "" {
 		t.Skip("set ETCD_TEST_ENDPOINT to a disposable local etcd endpoint")
@@ -21,7 +21,45 @@ func TestEtcdCompareAndPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cli.Close()
+	t.Cleanup(func() { cli.Close() })
+	return cli
+}
+
+func TestListNodes(t *testing.T) {
+	cli := testEtcdClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	prefix := fmt.Sprintf("/node-providerid-test-list-%d/", time.Now().UnixNano())
+	defer func() {
+		c, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_, _ = cli.Delete(c, prefix, clientv3.WithPrefix())
+	}()
+	nodes := map[string]string{"node-a": "k3s://node-a", "node-b": "", "node-c": "aws:///z/i-1"}
+	for name, id := range nodes {
+		body := fmt.Sprintf(`{"apiVersion":"v1","kind":"Node","metadata":{"name":%q},"spec":{"providerID":%q}}`, name, id)
+		if _, err := cli.Put(ctx, prefix+name, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A nested key (not a direct Node) must be ignored, not decoded.
+	if _, err := cli.Put(ctx, prefix+"node-a/extra", "junk"); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := listNodes(cli, prefix, 10*time.Second, &buf); err != nil {
+		t.Fatalf("listNodes: %v", err)
+	}
+	want := "node-a\tk3s://node-a\nnode-b\t\nnode-c\taws:///z/i-1\n"
+	if buf.String() != want {
+		t.Fatalf("got %q want %q", buf.String(), want)
+	}
+}
+
+// Run only against a disposable, local etcd instance. This test uses a random
+// key outside /registry and removes it after testing successful and stale writes.
+func TestEtcdCompareAndPut(t *testing.T) {
+	cli := testEtcdClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	key := fmt.Sprintf("/node-providerid-test/%d", time.Now().UnixNano())
