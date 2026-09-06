@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	go.etcd.io/etcd/client/v3 v3.5.21
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
